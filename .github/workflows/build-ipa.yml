@@ -1,0 +1,164 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build & Package IPA
+    runs-on: macos-14
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode Version
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.4.app || sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Locate Project Directory
+        id: locate_project
+        run: |
+          if [ -d "ThreeOneOSFive.xcodeproj" ]; then
+            echo "PROJECT_DIR=." >> $GITHUB_ENV
+            echo "XCODE_PROJ=ThreeOneOSFive.xcodeproj" >> $GITHUB_ENV
+          elif [ -d "3105-main/ThreeOneOSFive.xcodeproj" ]; then
+            echo "PROJECT_DIR=3105-main" >> $GITHUB_ENV
+            echo "XCODE_PROJ=3105-main/ThreeOneOSFive.xcodeproj" >> $GITHUB_ENV
+          else
+            FOUND_PROJ=$(find . -name "*.xcodeproj" -maxdepth 2 | head -n 1)
+            echo "PROJECT_DIR=$(dirname "$FOUND_PROJ")" >> $GITHUB_ENV
+            echo "XCODE_PROJ=$FOUND_PROJ" >> $GITHUB_ENV
+          fi
+
+      - name: Install iOS Certificate & Provisioning Profile
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          
+          # Tim va copy cert.mobileprovision
+          PROFILE_PATH=""
+          for candidate in "ci_certs/cert.mobileprovision" "certificate 2/cert.mobileprovision" "cert.mobileprovision"; do
+            if [ -f "$candidate" ]; then
+              PROFILE_PATH="$candidate"
+              break
+            fi
+          done
+          
+          if [ -n "$PROFILE_PATH" ]; then
+            echo "Found provisioning profile at $PROFILE_PATH"
+            cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/cert.mobileprovision
+            # Lay UUID cua profile de Xcode su dung
+            PROFILE_UUID=$(strings "$PROFILE_PATH" | grep -A1 -i "UUID" | grep string | sed -E 's/.*<string>(.*)<\/string>/\1/' | head -n 1 || true)
+            echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
+            if [ -n "$PROFILE_UUID" ]; then
+              cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprofile || true
+            fi
+          fi
+
+          # Cai dat cert.p12 vao Keychain voi pass 1
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          security create-keychain -p "buildpass" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "buildpass" $KEYCHAIN_PATH
+
+          P12_PATH=""
+          for candidate in "ci_certs/cert.p12" "certificate 2/cert.p12" "cert.p12"; do
+            if [ -f "$candidate" ]; then
+              P12_PATH="$candidate"
+              break
+            fi
+          done
+
+          if [ -f "$P12_PATH" ]; then
+            echo "Importing certificate from $P12_PATH"
+            security import "$P12_PATH" -P "1" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+            security set-key-partition-list -S apple-tool:,apple: -s -k "buildpass" $KEYCHAIN_PATH
+            security list-keychain -d user -s $KEYCHAIN_PATH
+            
+            CODE_SIGN_ID=$(security find-identity -v -p codesigning $KEYCHAIN_PATH | head -n 1 | awk -F'"' '{print $2}')
+            echo "CODE_SIGN_IDENTITY=$CODE_SIGN_ID" >> $GITHUB_ENV
+          fi
+
+      - name: Build Xcode Project
+        id: build_app
+        run: |
+          cd "${{ env.PROJECT_DIR }}"
+          
+          mkdir -p build_output
+          
+          SIGN_IDENTITY="${{ env.CODE_SIGN_IDENTITY }}"
+          if [ -z "$SIGN_IDENTITY" ]; then
+            SIGN_IDENTITY="-"
+          fi
+          
+          xcodebuild clean build \
+            -project ThreeOneOSFive.xcodeproj \
+            -scheme ThreeOneOSFive \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build_output/DerivedData \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_ALLOW_ENTITLEMENT_MODIFICATION=YES \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES || true
+
+      - name: Package IPA (Payload Method)
+        run: |
+          cd "${{ env.PROJECT_DIR }}"
+          mkdir -p build_output/Payload
+          
+          # Tim thu muc .app da duoc compile
+          APP_DIR=$(find build_output/DerivedData/Build/Products/Release-iphoneos -name "*.app" -maxdepth 1 | head -n 1)
+          
+          if [ -z "$APP_DIR" ] || [ ! -d "$APP_DIR" ]; then
+            echo "App bundle not found in DerivedData, searching deeper..."
+            APP_DIR=$(find build_output -name "*.app" | head -n 1)
+          fi
+          
+          if [ -d "$APP_DIR" ]; then
+            echo "Packaging app: $APP_DIR"
+            cp -R "$APP_DIR" build_output/Payload/
+            
+            # Embed mobileprovision neu co
+            if [ -f ~/Library/MobileDevice/Provisioning\ Profiles/cert.mobileprovision ]; then
+              APP_NAME_EXT=$(basename "$APP_DIR")
+              cp ~/Library/MobileDevice/Provisioning\ Profiles/cert.mobileprovision "build_output/Payload/$APP_NAME_EXT/embedded.mobileprovision"
+            fi
+            
+            cd build_output
+            zip -r -y "3105.ipa" Payload
+            cd ..
+            mkdir -p ${{ github.workspace }}/artifacts
+            cp build_output/3105.ipa ${{ github.workspace }}/artifacts/
+          else
+            echo "::error::Compilation failed, no .app bundle created."
+            exit 1
+          fi
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3105-IPA
+          path: artifacts/3105.ipa
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || 'v1.1.1' }}
+          name: "Release 3105 - ${{ github.ref_name || 'v1.1.1' }}"
+          files: artifacts/3105.ipa
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

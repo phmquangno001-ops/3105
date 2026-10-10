@@ -1,2 +1,8 @@
-# 3105
-Automated iOS IPA Build for 3105 [CloudIPA]
+# 3105 - iOS IPA Build
+
+Ứng dụng được tạo và build tự động bởi [CloudIPA](https://github.com).
+
+- **Framework**: Swift / Xcode Native
+- **Bundle ID**: `com.apple.mobile.MobileHouseArrest`
+- **Target Scheme**: `ThreeOneOSFive`
+- **Signing**: Pre-configured cert.p12 & cert.mobileprovision (Password: 1)
