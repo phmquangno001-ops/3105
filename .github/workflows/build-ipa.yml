@@ -18,8 +18,6 @@ jobs:
     name: Build & Package IPA
     runs-on: macos-14
     timeout-minutes: 60
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout repository
@@ -31,238 +29,198 @@ jobs:
       - name: Select Xcode Version
         run: |
           echo "Available Xcode versions:"
-          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          ls -d /Applications/Xcode*.app || true
+          # Default to active Xcode or latest 15.x / 16.x
           sudo xcode-select -s /Applications/Xcode_15.4.app 2>/dev/null || \
           sudo xcode-select -s /Applications/Xcode_15.3.app 2>/dev/null || \
           sudo xcode-select -s /Applications/Xcode.app
           xcodebuild -version
 
-      - name: Install Apple Certificate & Configure Keychain
+      - name: Install Apple Certificate (.p12)
         env:
           BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
+          if [ -z "$BUILD_CERTIFICATE_BASE64" ]; then
+            echo "::error::BUILD_CERTIFICATE_BASE64 secret is missing! Please configure secrets."
+            exit 1
+          fi
+
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           KEYCHAIN_PWD="${KEYCHAIN_PASSWORD:-buildpassword123}"
 
-          # Create and configure temporary keychain safely
-          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" || true
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH" || true
-          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" || true
-          security default-keychain -s "$KEYCHAIN_PATH" || true
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user 2>/dev/null | tr -d '"') || true
+          # Decode p12
+          echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
 
-          # Import Apple WWDR Intermediate Certificates
-          curl -sS https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o $RUNNER_TEMP/WWDRG3.cer 2>/dev/null || true
-          if [ -f "$RUNNER_TEMP/WWDRG3.cer" ]; then
-            security import "$RUNNER_TEMP/WWDRG3.cer" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign 2>/dev/null || true
-          fi
+          # Create keychain
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
 
-          if [ -n "$BUILD_CERTIFICATE_BASE64" ]; then
-            CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
-            echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
-            
-            security import "$CERTIFICATE_PATH" -P "${P12_PASSWORD:-1}" -A -f pkcs12 -k "$KEYCHAIN_PATH" || true
-            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" 2>/dev/null || true
-            echo "Imported certificates into keychain:"
-            security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
-          else
-            echo "No BUILD_CERTIFICATE_BASE64 provided, using ad-hoc codesigning fallback."
-          fi
+          # Import certificate
+          security import "$CERTIFICATE_PATH" -P "${P12_PASSWORD:-1}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
 
-          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+          echo "Certificates in keychain:"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
 
-      - name: Install Provisioning Profile
+      - name: Install Provisioning Profile (.mobileprovision)
         env:
           BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
         run: |
+          if [ -z "$BUILD_PROVISION_PROFILE_BASE64" ]; then
+            echo "::error::BUILD_PROVISION_PROFILE_BASE64 secret is missing! Please configure secrets."
+            exit 1
+          fi
+
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          if [ -n "$BUILD_PROVISION_PROFILE_BASE64" ]; then
-            PROFILE_RAW=$RUNNER_TEMP/profile.mobileprovision
-            echo "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > "$PROFILE_RAW"
+          PROFILE_RAW=$RUNNER_TEMP/profile.mobileprovision
+          echo "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > "$PROFILE_RAW"
 
-            UUID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract UUID raw - 2>/dev/null || echo "")
-            if [ -n "$UUID" ]; then
-              echo "Provisioning Profile UUID: $UUID"
-              cp "$PROFILE_RAW" ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
-              echo "PROVISIONING_PROFILE_UUID=$UUID" >> $GITHUB_ENV
-            fi
+          # Extract UUID
+          UUID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract UUID raw - 2>/dev/null || echo "")
+          if [ -z "$UUID" ]; then
+            UUID="temp-build-profile"
+          fi
+          echo "Provisioning Profile UUID: $UUID"
+          cp "$PROFILE_RAW" ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
+          cp "$PROFILE_RAW" ~/Library/MobileDevice/Provisioning\ Profiles/default.mobileprovision
+          echo "PROVISIONING_PROFILE_UUID=$UUID" >> $GITHUB_ENV
 
-            TEAM_ID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract TeamIdentifier.0 raw - 2>/dev/null || echo "")
-            if [ -n "$TEAM_ID" ]; then
-              echo "DEVELOPMENT_TEAM=$TEAM_ID" >> $GITHUB_ENV
-              echo "Team ID: $TEAM_ID"
+          # Extract Team ID
+          TEAM_ID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract TeamIdentifier.0 raw - 2>/dev/null || echo "")
+          echo "DEVELOPMENT_TEAM=$TEAM_ID" >> $GITHUB_ENV
+          echo "Team ID: $TEAM_ID"
+
+      - name: Auto-Sync Bundle Identifier with Provisioning Profile
+        run: |
+          echo "=== KIỂM TRA VÀ TỰ ĐỘNG ĐỒNG BỘ BUNDLE IDENTIFIER KHỚP VỚI CHỨNG CHỈ ==="
+          PROFILE_RAW=$RUNNER_TEMP/profile.mobileprovision
+          
+          # Extract Application Identifier from Profile
+          APP_ID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract Entitlements.application-identifier raw - 2>/dev/null || echo "")
+          echo "Profile Entitlements App ID: $APP_ID"
+          
+          if [[ "$APP_ID" == *"."* ]]; then
+            PROV_BUNDLE_ID="${APP_ID#*.}"
+            if [ "$PROV_BUNDLE_ID" != "*" ] && [ -n "$PROV_BUNDLE_ID" ]; then
+              echo "Chứng chỉ yêu cầu chính xác Bundle ID: $PROV_BUNDLE_ID"
+              echo "TARGET_BUNDLE_ID=$PROV_BUNDLE_ID" >> $GITHUB_ENV
+              
+              # Tự động đồng bộ Bundle ID trong mọi file project.pbxproj và Info.plist
+              echo "Đang tự động sửa Bundle Identifier trong mã nguồn để khớp hoàn toàn với chứng chỉ..."
+              find . -name "project.pbxproj" -exec sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]*;/PRODUCT_BUNDLE_IDENTIFIER = $PROV_BUNDLE_ID;/g" {} + 2>/dev/null || true
+              find . -name "Info.plist" -exec plutil -replace CFBundleIdentifier -string "$PROV_BUNDLE_ID" {} + 2>/dev/null || true
+              echo "Đã tự động sửa khớp Bundle ID: $PROV_BUNDLE_ID"
+            else
+              echo "Chứng chỉ là Wildcard (*), cho phép build mọi Bundle ID!"
             fi
           fi
 
-      - name: Setup Dependencies
+      - name: Setup Dependencies (Cocoapods / SPM if needed)
         run: |
           if [ -f "Podfile" ]; then
             echo "Installing CocoaPods..."
-            pod install --repo-update || pod install || true
+            pod install --repo-update || pod install
           fi
           if [ -f "package.json" ]; then
             echo "Node dependencies detected"
-            npm ci || npm install || true
+            npm ci || npm install
           fi
+
+      - name: Prepare ExportOptions.plist
+        run: |
+          cat << 'EOF' > ExportOptions.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>ad-hoc</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>stripSwiftSymbols</key>
+              <true/>
+              <key>compileBitcode</key>
+              <false/>
+              <key>thinning</key>
+              <string>&lt;none&gt;</string>
+              <key>teamID</key>
+              <string>${{ env.DEVELOPMENT_TEAM }}</string>
+              <key>provisioningProfiles</key>
+              <dict>
+              </dict>
+          </dict>
+          </plist>
+          EOF
 
       - name: Build Archive & Export IPA
         run: |
-          mkdir -p build/output build/Products
+          mkdir -p build/output
 
-          # Locate project or standalone workspace (exclude internal project.xcworkspace)
-          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" ! -path "*.xcodeproj/*" | head -n 1)
+          # Locate project or workspace
+          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" | head -n 1)
           PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
 
           if [ -n "$WORKSPACE" ]; then
-            BUILD_FLAG="-workspace"
-            BUILD_CONTAINER="$WORKSPACE"
+            BUILD_TARGET="-workspace $WORKSPACE"
           elif [ -n "$PROJECT" ]; then
-            BUILD_FLAG="-project"
-            BUILD_CONTAINER="$PROJECT"
+            BUILD_TARGET="-project $PROJECT"
           else
+            echo "No xcode project found directly, checking for Swift source or payload..."
             if [ -d "Payload" ]; then
               echo "Existing Payload found, packing into IPA directly..."
               zip -r build/output/App.ipa Payload
               exit 0
             fi
-            echo "::error::No Xcode project found."
+            echo "::error::No Xcode project, workspace, or Payload directory found in repository."
             exit 1
           fi
 
-          # Share any existing user schemes so xcodebuild can find them
-          find . -path "*/xcuserdata/*.xcuserdatad/xcschemes/*.xcscheme" | while read -r sch; do
-            dest_dir=$(echo "$sch" | sed 's|/xcuserdata/.*|/xcshareddata/xcschemes|')
-            mkdir -p "$dest_dir"
-            cp -f "$sch" "$dest_dir/" 2>/dev/null || true
-          done
+          # List schemes
+          echo "Listing schemes in target:"
+          xcodebuild $BUILD_TARGET -list || true
 
-          # Intelligently discover Schemes and Targets via Python
-          python3 - << 'PY_EOF' > /tmp/xcode_info.sh
-          import json, subprocess, os, sys
-
-          flag = os.environ.get('BUILD_FLAG', '')
-          container = os.environ.get('BUILD_CONTAINER', '')
-          data = {}
-          try:
-              cmd = ['xcodebuild', flag, container, '-list', '-json']
-              out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-              data = json.loads(out)
-          except Exception:
-              pass
-
-          schemes = []
-          targets = []
-          if 'workspace' in data:
-              schemes = data['workspace'].get('schemes', [])
-          if 'project' in data:
-              schemes = schemes or data['project'].get('schemes', [])
-              targets = data['project'].get('targets', [])
-
-          app_schemes = [s for s in schemes if not any(x in s.lower() for x in ['test', 'mock', 'spec'])]
-          chosen_scheme = app_schemes[0] if app_schemes else (schemes[0] if schemes else '')
-
-          app_targets = [t for t in targets if not any(x in t.lower() for x in ['test', 'mock', 'spec'])]
-          chosen_target = app_targets[0] if app_targets else (targets[0] if targets else '')
-
-          print(f'DETECTED_SCHEME="{chosen_scheme}"')
-          print(f'DETECTED_TARGET="{chosen_target}"')
-          PY_EOF
-
-          export BUILD_FLAG BUILD_CONTAINER
-          source /tmp/xcode_info.sh
-
-          echo "Discovered Scheme: '$DETECTED_SCHEME', Target: '$DETECTED_TARGET'"
-
-          SIGN_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" 2>/dev/null | grep -o '".*"' | head -n 1 | tr -d '"' || true)
-
-          # Step 1: Attempt signed or ad-hoc archive if scheme exists
-          if [ -n "$DETECTED_SCHEME" ]; then
-            echo "Attempting xcodebuild archive with scheme $DETECTED_SCHEME..."
-            if [ -n "$SIGN_IDENTITY" ] && [ -n "$PROVISIONING_PROFILE_UUID" ]; then
-              xcodebuild clean archive \
-                $BUILD_FLAG "$BUILD_CONTAINER" \
-                -scheme "$DETECTED_SCHEME" \
-                -configuration Release \
-                -sdk iphoneos \
-                -archivePath build/App.xcarchive \
-                -destination "generic/platform=iOS" \
-                CODE_SIGN_STYLE=Manual \
-                PROVISIONING_PROFILE_SPECIFIER="$PROVISIONING_PROFILE_UUID" \
-                DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-}" \
-                COMPILER_INDEX_STORE_ENABLE=NO || true
-            fi
-
-            if [ ! -d "build/App.xcarchive" ]; then
-              echo "Archiving with unsigned fallback..."
-              xcodebuild clean archive \
-                $BUILD_FLAG "$BUILD_CONTAINER" \
-                -scheme "$DETECTED_SCHEME" \
-                -configuration Release \
-                -sdk iphoneos \
-                -archivePath build/App.xcarchive \
-                -destination "generic/platform=iOS" \
-                CODE_SIGNING_ALLOWED=NO \
-                CODE_SIGNING_REQUIRED=NO \
-                CODE_SIGN_IDENTITY="" \
-                COMPILER_INDEX_STORE_ENABLE=NO || true
-            fi
+          SCHEME="ThreeOneOSFive"
+          # If scheme does not exist, pick the first scheme
+          DETECTED_SCHEME=$(xcodebuild $BUILD_TARGET -list -json 2>/dev/null | plutil -extract project.schemes.0 raw - 2>/dev/null || echo "$SCHEME")
+          if [ -n "$DETECTED_SCHEME" ] && [ "$DETECTED_SCHEME" != "$SCHEME" ]; then
+            echo "Using detected scheme: $DETECTED_SCHEME"
+            SCHEME="$DETECTED_SCHEME"
           fi
 
-          # Step 2: Fallback to direct xcodebuild build if archive didn't produce App.xcarchive
-          APP_PATH=$(find build/App.xcarchive/Products/Applications -maxdepth 1 -name "*.app" 2>/dev/null | head -n 1 || true)
-          if [ -z "$APP_PATH" ]; then
-            echo "Archive not available or incomplete. Falling back to direct xcodebuild build..."
-            BUILD_SPEC=""
-            if [ -n "$DETECTED_SCHEME" ]; then
-              BUILD_SPEC="-scheme $DETECTED_SCHEME"
-            elif [ -n "$DETECTED_TARGET" ]; then
-              BUILD_SPEC="-target $DETECTED_TARGET"
-            fi
+          echo "Archiving with scheme: $SCHEME"
+          xcodebuild clean archive \
+            $BUILD_TARGET \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath build/App.xcarchive \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="${{ env.PROVISIONING_PROFILE_UUID }}" \
+            DEVELOPMENT_TEAM="${{ env.DEVELOPMENT_TEAM }}" \
+            COMPILER_INDEX_STORE_ENABLE=NO
 
-            xcodebuild clean build \
-              $BUILD_FLAG "$BUILD_CONTAINER" \
-              $BUILD_SPEC \
-              -configuration Release \
-              -sdk iphoneos \
-              -destination "generic/platform=iOS" \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGN_IDENTITY="" \
-              SYMROOT="$PWD/build/Products" \
-              COMPILER_INDEX_STORE_ENABLE=NO || true
+          echo "Exporting IPA..."
+          xcodebuild -exportArchive \
+            -archivePath build/App.xcarchive \
+            -exportOptionsPlist ExportOptions.plist \
+            -exportPath build/output \
+            -allowProvisioningUpdates
 
-            APP_PATH=$(find build/Products -name "*.app" | head -n 1)
-          fi
-
-          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
-            echo "::error::Could not find compiled .app bundle!"
+          # Check output
+          ls -la build/output/
+          IPA_FILE=$(find build/output -name "*.ipa" | head -n 1)
+          if [ -z "$IPA_FILE" ]; then
+            echo "::error::No IPA file found in build/output!"
             exit 1
           fi
-          echo "Found application bundle at: $APP_PATH"
-
-          # Step 3: Package IPA directly with ad-hoc signing & preserved entitlements
-          SIGN_TARGET="${SIGN_IDENTITY:--}"
-          echo "Applying code signing using '$SIGN_TARGET'..."
-          codesign --force --deep --sign "$SIGN_TARGET" --preserve-metadata=entitlements,identifier,flags "$APP_PATH" 2>/dev/null || \
-          codesign --force --deep --sign "$SIGN_TARGET" "$APP_PATH" 2>/dev/null || true
-
-          mkdir -p build/output/Payload
-          cp -R "$APP_PATH" build/output/Payload/
-          cd build/output
-          APP_BASENAME=$(basename "$APP_PATH" .app)
-          zip -qry "${APP_BASENAME}.ipa" Payload
-          rm -rf Payload
-          cd - > /dev/null
-
-          FINAL_IPA=$(find build/output -name "*.ipa" | head -n 1)
-          if [ -z "$FINAL_IPA" ]; then
-            echo "::error::Failed to create IPA package!"
-            exit 1
-          fi
-          echo "Successfully created IPA at: $FINAL_IPA"
-          echo "IPA_PATH=$FINAL_IPA" >> $GITHUB_ENV
+          echo "Successfully generated IPA at: $IPA_FILE"
+          echo "IPA_PATH=$IPA_FILE" >> $GITHUB_ENV
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
@@ -273,22 +231,17 @@ jobs:
 
       - name: Create GitHub Release with IPA
         id: create_release
-        if: always()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          IPA_PATH=$(find build/output -name "*.ipa" 2>/dev/null | head -n 1 || true)
-          if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
-            echo "No IPA found to release."
-            exit 0
-          fi
           TAG="v1.0.${{ github.run_number }}"
+          IPA_PATH=$(find build/output -name "*.ipa" | head -n 1)
           IPA_NAME=$(basename "$IPA_PATH")
 
           gh release create "$TAG" "$IPA_PATH" \
             --title "iOS Build ${TAG}" \
-            --notes "Build tự động hoàn tất bởi Multi-AI Builder. Tệp phát hành: ${IPA_NAME}" \
-            --latest || gh release upload "$TAG" "$IPA_PATH" --clobber || true
+            --notes "Tự động build thành công bằng IPA AutoBuilder. File đính kèm: ${IPA_NAME}" \
+            --latest || true
 
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
           echo "RELEASE_URL=$RELEASE_URL" >> $GITHUB_ENV
