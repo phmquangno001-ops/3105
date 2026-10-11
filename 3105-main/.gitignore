@@ -1,1 +1,44 @@
-IyBtYWNPUwouRFNfU3RvcmUKCiMgWGNvZGUgdXNlciBzdGF0ZQp4Y3VzZXJkYXRhLwoqLnhjdXNlcnN0YXRlCioueGNjaGVja291dAoqLnhjc2NtYmx1ZXByaW50CgojIEJ1aWxkIHByb2R1Y3RzCmJ1aWxkLwpEZXJpdmVkRGF0YS8KKi5pcGEKKi54Y2FyY2hpdmUKKi5kU1lNCiouZFNZTS56aXAKKi5hcHAKCiMgU3dpZnQgUGFja2FnZSBNYW5hZ2VyCi5idWlsZC8KLnN3aWZ0cG0vCgojIFNpZ25pbmcgbWF0ZXJpYWwgYW5kIGxvY2FsIGNvbmZpZ3VyYXRpb24KKi5jZXIKKi5wMTIKKi5wZW0KKi5rZXkKKi5tb2JpbGVwcm92aXNpb24KLmVudgouZW52LioKIS5lbnYuZXhhbXBsZQoKIyBMb2NhbCBRQSBhcnRpZmFjdHMgYW5kIGludGVybmFsIHdvcmtpbmcgbm90ZXMKLyoucG5nCi90YXNrcy8KL1Rlc3RzLwovLmdpdGh1Yi8KL0NPTlRSSUJVVElORy5tZAovU0VDVVJJVFkubWQKCiMgVGVtcG9yYXJ5IGZpbGVzCioudG1wCiouc3dwCip+Cg==
+# macOS
+.DS_Store
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Build products
+build/
+DerivedData/
+*.ipa
+*.xcarchive
+*.dSYM
+*.dSYM.zip
+*.app
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Signing material and local configuration
+*.cer
+*.p12
+*.pem
+*.key
+*.mobileprovision
+.env
+.env.*
+!.env.example
+
+# Local QA artifacts and internal working notes
+/*.png
+/tasks/
+/Tests/
+/.github/
+/CONTRIBUTING.md
+/SECURITY.md
+
+# Temporary files
+*.tmp
+*.swp
+*~
