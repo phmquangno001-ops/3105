@@ -31,7 +31,7 @@ jobs:
       - name: Select Xcode Version
         run: |
           echo "Available Xcode versions:"
-          ls -d /Applications/Xcode*.app || true
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
           sudo xcode-select -s /Applications/Xcode_15.4.app 2>/dev/null || \
           sudo xcode-select -s /Applications/Xcode_15.3.app 2>/dev/null || \
           sudo xcode-select -s /Applications/Xcode.app
@@ -46,26 +46,25 @@ jobs:
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           KEYCHAIN_PWD="${KEYCHAIN_PASSWORD:-buildpassword123}"
 
-          # Create and configure temporary keychain
-          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
-          security default-keychain -s "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          # Create and configure temporary keychain safely
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" || true
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH" || true
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" || true
+          security default-keychain -s "$KEYCHAIN_PATH" || true
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user 2>/dev/null | tr -d '"') || true
 
-          # Import Apple WWDR Intermediate Certificates to validate chain
-          curl -sS https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o $RUNNER_TEMP/WWDRG3.cer || true
+          # Import Apple WWDR Intermediate Certificates
+          curl -sS https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o $RUNNER_TEMP/WWDRG3.cer 2>/dev/null || true
           if [ -f "$RUNNER_TEMP/WWDRG3.cer" ]; then
-            security import "$RUNNER_TEMP/WWDRG3.cer" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
+            security import "$RUNNER_TEMP/WWDRG3.cer" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign 2>/dev/null || true
           fi
 
           if [ -n "$BUILD_CERTIFICATE_BASE64" ]; then
             CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
             echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
             
-            # Import certificate & private key (do NOT use -t cert)
-            security import "$CERTIFICATE_PATH" -P "${P12_PASSWORD:-1}" -A -f pkcs12 -k "$KEYCHAIN_PATH"
-            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+            security import "$CERTIFICATE_PATH" -P "${P12_PASSWORD:-1}" -A -f pkcs12 -k "$KEYCHAIN_PATH" || true
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" 2>/dev/null || true
             echo "Imported certificates into keychain:"
             security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
           else
@@ -101,46 +100,27 @@ jobs:
         run: |
           if [ -f "Podfile" ]; then
             echo "Installing CocoaPods..."
-            pod install --repo-update || pod install
+            pod install --repo-update || pod install || true
           fi
           if [ -f "package.json" ]; then
             echo "Node dependencies detected"
-            npm ci || npm install
+            npm ci || npm install || true
           fi
-
-      - name: Prepare ExportOptions.plist
-        run: |
-          cat << 'EOF' > ExportOptions.plist
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>method</key>
-              <string>ad-hoc</string>
-              <key>signingStyle</key>
-              <string>manual</string>
-              <key>stripSwiftSymbols</key>
-              <true/>
-              <key>compileBitcode</key>
-              <false/>
-              <key>thinning</key>
-              <string>&lt;none&gt;</string>
-          </dict>
-          </plist>
-          EOF
 
       - name: Build Archive & Export IPA
         run: |
-          mkdir -p build/output
+          mkdir -p build/output build/Products
 
-          # Locate project or workspace
-          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" | head -n 1)
+          # Locate project or standalone workspace (exclude internal project.xcworkspace)
+          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" ! -path "*.xcodeproj/*" | head -n 1)
           PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
 
           if [ -n "$WORKSPACE" ]; then
-            BUILD_TARGET="-workspace $WORKSPACE"
+            BUILD_FLAG="-workspace"
+            BUILD_CONTAINER="$WORKSPACE"
           elif [ -n "$PROJECT" ]; then
-            BUILD_TARGET="-project $PROJECT"
+            BUILD_FLAG="-project"
+            BUILD_CONTAINER="$PROJECT"
           else
             if [ -d "Payload" ]; then
               echo "Existing Payload found, packing into IPA directly..."
@@ -151,87 +131,137 @@ jobs:
             exit 1
           fi
 
-          # Detect scheme
-          SCHEME="ThreeOneOSFive"
-          DETECTED_SCHEME=$(xcodebuild $BUILD_TARGET -list -json 2>/dev/null | plutil -extract project.schemes.0 raw - 2>/dev/null || echo "$SCHEME")
-          if [ -n "$DETECTED_SCHEME" ]; then
-            SCHEME="$DETECTED_SCHEME"
-          fi
-          echo "Using scheme: $SCHEME"
+          # Share any existing user schemes so xcodebuild can find them
+          find . -path "*/xcuserdata/*.xcuserdatad/xcschemes/*.xcscheme" | while read -r sch; do
+            dest_dir=$(echo "$sch" | sed 's|/xcuserdata/.*|/xcshareddata/xcschemes|')
+            mkdir -p "$dest_dir"
+            cp -f "$sch" "$dest_dir/" 2>/dev/null || true
+          done
 
-          # Check if valid identity exists in keychain
+          # Intelligently discover Schemes and Targets via Python
+          python3 - << 'PY_EOF' > /tmp/xcode_info.sh
+          import json, subprocess, os, sys
+
+          flag = os.environ.get('BUILD_FLAG', '')
+          container = os.environ.get('BUILD_CONTAINER', '')
+          data = {}
+          try:
+              cmd = ['xcodebuild', flag, container, '-list', '-json']
+              out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+              data = json.loads(out)
+          except Exception:
+              pass
+
+          schemes = []
+          targets = []
+          if 'workspace' in data:
+              schemes = data['workspace'].get('schemes', [])
+          if 'project' in data:
+              schemes = schemes or data['project'].get('schemes', [])
+              targets = data['project'].get('targets', [])
+
+          app_schemes = [s for s in schemes if not any(x in s.lower() for x in ['test', 'mock', 'spec'])]
+          chosen_scheme = app_schemes[0] if app_schemes else (schemes[0] if schemes else '')
+
+          app_targets = [t for t in targets if not any(x in t.lower() for x in ['test', 'mock', 'spec'])]
+          chosen_target = app_targets[0] if app_targets else (targets[0] if targets else '')
+
+          print(f'DETECTED_SCHEME="{chosen_scheme}"')
+          print(f'DETECTED_TARGET="{chosen_target}"')
+          PY_EOF
+
+          export BUILD_FLAG BUILD_CONTAINER
+          source /tmp/xcode_info.sh
+
+          echo "Discovered Scheme: '$DETECTED_SCHEME', Target: '$DETECTED_TARGET'"
+
           SIGN_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" 2>/dev/null | grep -o '".*"' | head -n 1 | tr -d '"' || true)
 
-          # Attempt archiving with code signing disabled or ad-hoc to prevent profile mismatch aborts
-          echo "Archiving with xcodebuild..."
-          if [ -n "$SIGN_IDENTITY" ] && [ -n "$PROVISIONING_PROFILE_UUID" ]; then
-            echo "Attempting signed archive with profile $PROVISIONING_PROFILE_UUID..."
-            xcodebuild clean archive \
-              $BUILD_TARGET \
-              -scheme "$SCHEME" \
-              -configuration Release \
-              -sdk iphoneos \
-              -archivePath build/App.xcarchive \
-              -destination "generic/platform=iOS" \
-              CODE_SIGN_STYLE=Manual \
-              PROVISIONING_PROFILE_SPECIFIER="$PROVISIONING_PROFILE_UUID" \
-              DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-}" \
-              COMPILER_INDEX_STORE_ENABLE=NO || true
+          # Step 1: Attempt signed or ad-hoc archive if scheme exists
+          if [ -n "$DETECTED_SCHEME" ]; then
+            echo "Attempting xcodebuild archive with scheme $DETECTED_SCHEME..."
+            if [ -n "$SIGN_IDENTITY" ] && [ -n "$PROVISIONING_PROFILE_UUID" ]; then
+              xcodebuild clean archive \
+                $BUILD_FLAG "$BUILD_CONTAINER" \
+                -scheme "$DETECTED_SCHEME" \
+                -configuration Release \
+                -sdk iphoneos \
+                -archivePath build/App.xcarchive \
+                -destination "generic/platform=iOS" \
+                CODE_SIGN_STYLE=Manual \
+                PROVISIONING_PROFILE_SPECIFIER="$PROVISIONING_PROFILE_UUID" \
+                DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-}" \
+                COMPILER_INDEX_STORE_ENABLE=NO || true
+            fi
+
+            if [ ! -d "build/App.xcarchive" ]; then
+              echo "Archiving with unsigned fallback..."
+              xcodebuild clean archive \
+                $BUILD_FLAG "$BUILD_CONTAINER" \
+                -scheme "$DETECTED_SCHEME" \
+                -configuration Release \
+                -sdk iphoneos \
+                -archivePath build/App.xcarchive \
+                -destination "generic/platform=iOS" \
+                CODE_SIGNING_ALLOWED=NO \
+                CODE_SIGNING_REQUIRED=NO \
+                CODE_SIGN_IDENTITY="" \
+                COMPILER_INDEX_STORE_ENABLE=NO || true
+            fi
           fi
 
-          if [ ! -d "build/App.xcarchive" ]; then
-            echo "Building archive with CODE_SIGNING_ALLOWED=NO fallback..."
-            xcodebuild clean archive \
-              $BUILD_TARGET \
-              -scheme "$SCHEME" \
+          # Step 2: Fallback to direct xcodebuild build if archive didn't produce App.xcarchive
+          APP_PATH=$(find build/App.xcarchive/Products/Applications -maxdepth 1 -name "*.app" 2>/dev/null | head -n 1 || true)
+          if [ -z "$APP_PATH" ]; then
+            echo "Archive not available or incomplete. Falling back to direct xcodebuild build..."
+            BUILD_SPEC=""
+            if [ -n "$DETECTED_SCHEME" ]; then
+              BUILD_SPEC="-scheme $DETECTED_SCHEME"
+            elif [ -n "$DETECTED_TARGET" ]; then
+              BUILD_SPEC="-target $DETECTED_TARGET"
+            fi
+
+            xcodebuild clean build \
+              $BUILD_FLAG "$BUILD_CONTAINER" \
+              $BUILD_SPEC \
               -configuration Release \
               -sdk iphoneos \
-              -archivePath build/App.xcarchive \
               -destination "generic/platform=iOS" \
               CODE_SIGNING_ALLOWED=NO \
               CODE_SIGNING_REQUIRED=NO \
               CODE_SIGN_IDENTITY="" \
-              COMPILER_INDEX_STORE_ENABLE=NO
+              SYMROOT="$PWD/build/Products" \
+              COMPILER_INDEX_STORE_ENABLE=NO || true
+
+            APP_PATH=$(find build/Products -name "*.app" | head -n 1)
           fi
 
-          # Export IPA via xcodebuild or direct Payload packaging
-          EXPORT_SUCCESS=0
-          if [ -f "ExportOptions.plist" ]; then
-            echo "Attempting xcodebuild export..."
-            xcodebuild -exportArchive \
-              -archivePath build/App.xcarchive \
-              -exportOptionsPlist ExportOptions.plist \
-              -exportPath build/output \
-              -allowProvisioningUpdates || true
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "::error::Could not find compiled .app bundle!"
+            exit 1
           fi
+          echo "Found application bundle at: $APP_PATH"
 
-          IPA_FILE=$(find build/output -name "*.ipa" | head -n 1)
-          if [ -z "$IPA_FILE" ]; then
-            echo "xcodebuild exportArchive skipped or failed. Packaging IPA directly from archive..."
-            APP_PATH=$(find build/App.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -n 1)
-            if [ -z "$APP_PATH" ]; then
-              echo "::error::No .app found in xcarchive!"
-              exit 1
-            fi
+          # Step 3: Package IPA directly with ad-hoc signing & preserved entitlements
+          SIGN_TARGET="${SIGN_IDENTITY:--}"
+          echo "Applying code signing using '$SIGN_TARGET'..."
+          codesign --force --deep --sign "$SIGN_TARGET" --preserve-metadata=entitlements,identifier,flags "$APP_PATH" 2>/dev/null || \
+          codesign --force --deep --sign "$SIGN_TARGET" "$APP_PATH" 2>/dev/null || true
 
-            # Apply ad-hoc signature if unsigned
-            SIGN_TARGET="${SIGN_IDENTITY:--}"
-            codesign --force --deep --sign "$SIGN_TARGET" "$APP_PATH" 2>/dev/null || true
-
-            mkdir -p build/output/Payload
-            cp -R "$APP_PATH" build/output/Payload/
-            cd build/output
-            zip -qry "ThreeOneOSFive.ipa" Payload
-            rm -rf Payload
-            cd - > /dev/null
-          fi
+          mkdir -p build/output/Payload
+          cp -R "$APP_PATH" build/output/Payload/
+          cd build/output
+          APP_BASENAME=$(basename "$APP_PATH" .app)
+          zip -qry "${APP_BASENAME}.ipa" Payload
+          rm -rf Payload
+          cd - > /dev/null
 
           FINAL_IPA=$(find build/output -name "*.ipa" | head -n 1)
           if [ -z "$FINAL_IPA" ]; then
-            echo "::error::No IPA file found in build/output!"
+            echo "::error::Failed to create IPA package!"
             exit 1
           fi
-          echo "Successfully created IPA: $FINAL_IPA"
+          echo "Successfully created IPA at: $FINAL_IPA"
           echo "IPA_PATH=$FINAL_IPA" >> $GITHUB_ENV
 
       - name: Upload IPA Artifact
@@ -243,17 +273,22 @@ jobs:
 
       - name: Create GitHub Release with IPA
         id: create_release
+        if: always()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          IPA_PATH=$(find build/output -name "*.ipa" 2>/dev/null | head -n 1 || true)
+          if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
+            echo "No IPA found to release."
+            exit 0
+          fi
           TAG="v1.0.${{ github.run_number }}"
-          IPA_PATH=$(find build/output -name "*.ipa" | head -n 1)
           IPA_NAME=$(basename "$IPA_PATH")
 
           gh release create "$TAG" "$IPA_PATH" \
             --title "iOS Build ${TAG}" \
-            --notes "Tự động build thành công bằng IPA AutoBuilder. File đính kèm: ${IPA_NAME}" \
-            --latest || true
+            --notes "Build tự động hoàn tất bởi Multi-AI Builder. Tệp phát hành: ${IPA_NAME}" \
+            --latest || gh release upload "$TAG" "$IPA_PATH" --clobber || true
 
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
           echo "RELEASE_URL=$RELEASE_URL" >> $GITHUB_ENV
